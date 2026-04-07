@@ -17,8 +17,7 @@ IFS=$'\n\t'
 #   $BACKUP_BASE/<instance>/info into the backup directory
 # - fallback: scan info dir for any *.backup containing the LABEL string
 
-PG_BASEBACKUP=${PG_BASEBACKUP:-pg_basebackup}
-PSQL_CMD=${PSQL_CMD:-psql}
+# This script calls the system 'pg_basebackup' command directly.
 
 usage() {
   cat <<EOF
@@ -67,43 +66,19 @@ echo "Starting pg_basebackup for instance='$INSTANCE' -> $BACKUP_DIR"
 
 LABEL="pg_basebackup $INSTANCE $TS"
 
-"$PG_BASEBACKUP" -D "$BACKUP_DIR" -F tar -X none -Z zstd:workers=0 -c fast -l "$LABEL" --manifest-checksums=sha256 -w
+pg_basebackup -D "$BACKUP_DIR" -F tar -X none -Z zstd:workers=0 -c fast -l "$LABEL" --manifest-checksums=sha256 -w
 
 # success: disable trap cleanup and continue
 trap - ERR INT TERM
 echo "pg_basebackup completed successfully: $BACKUP_DIR"
 
-# Find a single manifest file inside the backup dir (targeted locations, no recursion)
-MANIFEST_FILE=""
-MANIFEST_CANDIDATES=(
-  "$BACKUP_DIR/backup_manifest.json"
-  "$BACKUP_DIR/manifest/backup_manifest.json"
-  "$BACKUP_DIR/backup_manifest/manifest.json"
-  "$BACKUP_DIR/manifest.json"
-)
-for f in "${MANIFEST_CANDIDATES[@]}"; do
-  if [ -f "$f" ]; then
-    MANIFEST_FILE="$f"
-    break
-  fi
-done
-
-# top-level fallback: any file in backup dir matching *manifest*.json (non-recursive)
-if [ -z "$MANIFEST_FILE" ]; then
-  for f in "$BACKUP_DIR"/*manifest*.json; do
-    if [ -f "$f" ]; then
-      MANIFEST_FILE="$f"
-      break
-    fi
-  done
-fi
-
-if [ -z "$MANIFEST_FILE" ]; then
-  echo "Warning: manifest file not found in $BACKUP_DIR; cannot determine Start-LSN. Leaving backup-info in $INFO_DIR" >&2
+MANIFEST_FILE="$BACKUP_DIR/backup_manifest"
+if [ ! -f "$MANIFEST_FILE" ]; then
+  echo "Warning: manifest ($MANIFEST_FILE) not found; leaving backup-info in $INFO_DIR" >&2
   exit 0
 fi
 
-# Extract Start-LSN from manifest (jq preferred)
+# Extract Start-LSN from the manifest file only
 if command -v jq >/dev/null 2>&1; then
   START_LSN=$(jq -r '."WAL-Ranges"[0]."Start-LSN" // empty' "$MANIFEST_FILE" 2>/dev/null || true)
 else
@@ -111,59 +86,27 @@ else
 fi
 
 if [ -z "$START_LSN" ]; then
-  echo "Warning: Start-LSN not found in manifest $MANIFEST_FILE; leaving backup-info in $INFO_DIR" >&2
+  echo "Warning: Start-LSN not found in $MANIFEST_FILE; leaving backup-info in $INFO_DIR" >&2
   exit 0
 fi
 
-if ! command -v "$PSQL_CMD" >/dev/null 2>&1; then
-  echo "psql not available to compute WAL filename; leaving backup-info in $INFO_DIR" >&2
+if ! command -v psql >/dev/null 2>&1; then
+  echo "psql not available; leaving backup-info in $INFO_DIR" >&2
   exit 0
 fi
 
-# Function to try moving info by wal-name
-try_move_info() {
-  local name="$1"
-  [ -z "$name" ] && return 1
-  local cand="$INFO_DIR/${name}.backup"
-  if [ -f "$cand" ]; then
-    mv -- "$cand" "$BACKUP_DIR/" || { echo "Failed to move $cand" >&2; return 1; }
-    if [ -f "$INFO_DIR/${name}.sha256" ]; then
-      mv -- "$INFO_DIR/${name}.sha256" "$BACKUP_DIR/" || true
-    fi
-    echo "Moved backup-info $cand -> $BACKUP_DIR/"
-    return 0
+WAL_NAME=$(psql -t -A -c "SELECT pg_walfile_name('$START_LSN'::pg_lsn);" 2>/dev/null || true)
+if [ -n "$WAL_NAME" ] && [ -f "$INFO_DIR/${WAL_NAME}.backup" ]; then
+  mv -- "$INFO_DIR/${WAL_NAME}.backup" "$BACKUP_DIR/" || true
+  if [ -f "$INFO_DIR/${WAL_NAME}.sha256" ]; then
+    mv -- "$INFO_DIR/${WAL_NAME}.sha256" "$BACKUP_DIR/" || true
   fi
-  return 1
-}
-
-# Compute WAL name for START_LSN using pg_walfile_name
-WAL_NAME=$("$PSQL_CMD" -t -A -c "SELECT pg_walfile_name('$START_LSN'::pg_lsn);" 2>/dev/null || true)
-if try_move_info "$WAL_NAME"; then
+  echo "Moved backup-info ${WAL_NAME}.backup -> $BACKUP_DIR/"
+  exit 0
+else
+  echo "No matching ${WAL_NAME}.backup in $INFO_DIR; leaving files in place" >&2
   exit 0
 fi
-
-# Fallback: look for any *.backup in info that contains the LABEL
-found_any=0
-if [ -d "$INFO_DIR" ]; then
-  for f in "$INFO_DIR"/*.backup; do
-    [ -e "$f" ] || continue
-    if grep -qF "$LABEL" "$f" 2>/dev/null; then
-      mv -- "$f" "$BACKUP_DIR/" || echo "Failed to move $f" >&2
-      if [ -f "${f%.backup}.sha256" ]; then
-        mv -- "${f%.backup}.sha256" "$BACKUP_DIR/" || true
-      fi
-      echo "Moved backup-info $f -> $BACKUP_DIR/"
-      found_any=1
-    fi
-  done
-fi
-
-if [ "$found_any" -eq 1 ]; then
-  exit 0
-fi
-
-echo "No matching backup-info file found in $INFO_DIR for Start-LSN $START_LSN (WAL name: $WAL_NAME) or by LABEL $LABEL" >&2
-exit 0
 #!/usr/bin/env bash
 set -euo pipefail
 IFS=$'\n\t'
