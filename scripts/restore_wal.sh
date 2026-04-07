@@ -18,31 +18,30 @@ IFS=$'\n\t'
 
 usage() {
   cat <<EOF
-Usage: $0 <instance> <filename> <target>
+Usage: $0 <backup-base> <instance> <filename> <target>
 
 Examples:
-  $0 main 00000001000000000000000A /var/lib/postgresql/12/main/pg_wal/00000001000000000000000A
-  $0 main 00000001.history /tmp/00000001.history
+  $0 /var/lib/postgresql/backup main 00000001000000000000000A /var/lib/postgresql/12/main/pg_wal/00000001000000000000000A
+  $0 /var/lib/postgresql/backup main 00000001.history /tmp/00000001.history
 
-Environment:
-  BACKUP_BASE (optional) - default: /var/lib/postgresql/backup
-
-This script strictly supports the canonical compressed WAL and timeline
-history formats produced by the archive tooling and will not attempt
-heuristics or alternate suffixes.
+Notes:
+  - The first argument is the same <backup-base> used by the archiver scripts.
+  - This script strictly supports the canonical compressed WAL and timeline
+    history formats produced by the archive tooling and will not attempt
+    heuristics or alternate suffixes.
 EOF
   exit 2
 }
 
-if [ "$#" -ne 3 ]; then
+if [ "$#" -ne 4 ]; then
   usage
 fi
 
-INSTANCE="$1"
-FILENAME="$2"
-TARGET="$3"
+BACKUP_BASE="$1"
+INSTANCE="$2"
+FILENAME="$3"
+TARGET="$4"
 
-BACKUP_BASE="${BACKUP_BASE:-/var/lib/postgresql/backup}"
 WAL_DIR="$BACKUP_BASE/$INSTANCE/wal"
 INFO_DIR="$BACKUP_BASE/$INSTANCE/info"
 
