@@ -106,7 +106,9 @@ done
 
 if [ "${#to_delete[@]}" -eq 0 ]; then
   echo "No backups older than ${MAX_AGE_DAYS} day(s) found (newest: $newest_name)."
-  exit 0
+  echo "Continuing to WAL and timeline pruning based on current backups."
+else
+  :
 fi
 
 if [ -n "${DRY_RUN:-}" ]; then
@@ -118,15 +120,21 @@ if [ -n "${DRY_RUN:-}" ]; then
   # do not exit here; allow DRY_RUN to simulate WAL and history pruning as well
 fi
 
-echo "Pruning ${#to_delete[@]} backup(s) older than ${MAX_AGE_DAYS} day(s) under $TARGET_DIR (kept newest: $newest_name)"
-for d in "${to_delete[@]}"; do
-  if [ -d "$d" ]; then
-    echo "Deleting $d"
-    rm -rf -- "$d"
-  else
-    echo "Skipping non-existent $d"
-  fi
-done
+if [ "${#to_delete[@]}" -gt 0 ]; then
+  echo "Pruning ${#to_delete[@]} backup(s) older than ${MAX_AGE_DAYS} day(s) under $TARGET_DIR (kept newest: $newest_name)"
+  for d in "${to_delete[@]}"; do
+    if [ -d "$d" ]; then
+      if [ -n "${DRY_RUN:-}" ]; then
+        echo "DRY RUN: would delete $d"
+      else
+        echo "Deleting $d"
+        rm -rf -- "$d"
+      fi
+    else
+      echo "Skipping non-existent $d"
+    fi
+  done
+fi
 
 # After deleting backups, determine the oldest existing backup (we always keep newest)
 # and use its backup_info to compute the cutoff WAL. This ensures we remove
@@ -173,27 +181,25 @@ if [ -d "$WAL_DIR" ]; then
   if ! [[ "$CUTOFF_WAL_UPPER" =~ ^[0-9A-F]{24}$ ]]; then
     echo "Computed cutoff WAL '$CUTOFF_WAL' does not look like a 24-hex WAL filename; skipping WAL pruning" >&2
   else
-    # consider common compressed suffixes (.zst, .zstd). Use lexicographic compare
-    for ext in zst zstd; do
-      for wf in "$WAL_DIR"/*."$ext"; do
-        [ -e "$wf" ] || continue
-        wbase="${wf##*/}"
-        wbase="${wbase%.$ext}"
-        wbase_upper=$(echo "$wbase" | tr '[:lower:]' '[:upper:]')
-        if ! [[ "$wbase_upper" =~ ^[0-9A-F]{24}$ ]]; then
-          echo "Skipping non-conforming WAL file: $wf"
-          continue
+    # Only handle the canonical compressed suffix '.zst' (no fallbacks).
+    for wf in "$WAL_DIR"/*.zst; do
+      [ -e "$wf" ] || continue
+      wbase="${wf##*/}"
+      wbase="${wbase%.zst}"
+      wbase_upper=$(echo "$wbase" | tr '[:lower:]' '[:upper:]')
+      if ! [[ "$wbase_upper" =~ ^[0-9A-F]{24}$ ]]; then
+        echo "Skipping non-conforming WAL file: $wf"
+        continue
+      fi
+      if [[ "$wbase_upper" < "$CUTOFF_WAL_UPPER" ]]; then
+        if [ -n "${DRY_RUN:-}" ]; then
+          echo "DRY RUN: would delete WAL $wf and checksum $WAL_DIR/${wbase}.sha256"
+        else
+          echo "Deleting WAL $wf"
+          rm -f -- "$wf"
+          rm -f -- "$WAL_DIR/${wbase}.sha256" || true
         fi
-        if [[ "$wbase_upper" < "$CUTOFF_WAL_UPPER" ]]; then
-          if [ -n "${DRY_RUN:-}" ]; then
-            echo "DRY RUN: would delete WAL $wf and checksum $WAL_DIR/${wbase}.sha256"
-          else
-            echo "Deleting WAL $wf"
-            rm -f -- "$wf"
-            rm -f -- "$WAL_DIR/${wbase}.sha256" || true
-          fi
-        fi
-      done
+      fi
     done
   fi
 else
@@ -220,7 +226,8 @@ if [ -n "$TIMELINE_NUM" ]; then
     echo "Pruning timeline history files older than ${TIMELINE_HEX}.history in $WAL_DIR (based on START TIMELINE $TIMELINE_NUM)"
   fi
   if [ -d "$WAL_DIR" ]; then
-    for hf in "$WAL_DIR"/*.history*; do
+    # Only handle canonical history suffix '.history' and compressed '.history.zst'
+    for hf in "$WAL_DIR"/*.history "$WAL_DIR"/*.history.zst; do
       [ -e "$hf" ] || continue
       hbase="${hf##*/}"
       # extract leading 8-hex chars
