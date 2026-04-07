@@ -60,8 +60,8 @@ fi
 # Consider only directories directly under $TARGET_DIR
 mapfile -t candidates < <(find "$TARGET_DIR" -maxdepth 1 -mindepth 1 -type d -printf '%f\n' 2>/dev/null | grep -E '^[0-9]{8}T[0-9]{6}Z$' || true)
 
-if [ "${#candidates[@]}" -le 1 ]; then
-  echo "Nothing to prune: ${#candidates[@]} backup(s) present; always keep at least one."
+if [ "${#candidates[@]}" -eq 0 ]; then
+  echo "No backups found under $TARGET_DIR; nothing to do." >&2
   exit 0
 fi
 
@@ -72,6 +72,7 @@ newest_index=$((${#sorted[@]} - 1))
 newest_name="${sorted[$newest_index]}"
 
 to_delete=()
+to_delete_names=()
 
 # Compute a cutoff timestamp string in the same sortable format as our
 # backup folders (YYYYMMDDTHHMMSSZ). Any folder lexicographically less than
@@ -101,6 +102,7 @@ for i in "${!sorted[@]}"; do
   # Lexicographic compare: timestamps in format YYYYMMDDTHHMMSSZ sort correctly
   if [[ "$name" < "$CUT_OFF_STR" ]]; then
     to_delete+=("$TARGET_DIR/$name")
+    to_delete_names+=("$name")
   fi
 done
 
@@ -142,7 +144,27 @@ fi
 WAL_DIR="$BACKUP_BASE/$INSTANCE/wal"
 
 # Recompute remaining timestamped backups
-mapfile -t remaining < <(find "$TARGET_DIR" -maxdepth 1 -mindepth 1 -type d -printf '%f\n' 2>/dev/null | grep -E '^[0-9]{8}T[0-9]{6}Z$' | sort || true)
+# If DRY_RUN is set we must simulate the post-prune state (remove the
+# names scheduled for deletion from the original sorted list). Otherwise
+# re-scan the filesystem to get the actual remaining backups.
+if [ -n "${DRY_RUN:-}" ]; then
+  remaining=()
+  for name in "${sorted[@]}"; do
+    skip=false
+    for del in "${to_delete_names[@]:-}"; do
+      if [ "$name" = "$del" ]; then
+        skip=true
+        break
+      fi
+    done
+    if [ "$skip" = false ]; then
+      remaining+=("$name")
+    fi
+  done
+else
+  mapfile -t remaining < <(find "$TARGET_DIR" -maxdepth 1 -mindepth 1 -type d -printf '%f\n' 2>/dev/null | grep -E '^[0-9]{8}T[0-9]{6}Z$' | sort || true)
+fi
+
 if [ "${#remaining[@]}" -eq 0 ]; then
   echo "No backups remain after pruning; skipping WAL pruning" >&2
   echo "Housekeeping complete."
