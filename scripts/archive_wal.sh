@@ -65,7 +65,7 @@ cleanup_on_error() {
   fi
 }
 
-trap 'cleanup_on_error; exit 2' ERR INT TERM
+trap 'rc=$?; echo "Error archiving $SRC (exit code $rc)" >&2; cleanup_on_error; exit 2' ERR INT TERM
 
 if [ -f "$ZST_PATH" ]; then
   # Archive exists; require exact checksum file name
@@ -84,7 +84,8 @@ if [ -f "$ZST_PATH" ]; then
   fi
 else
   # Compress directly into destination path (no temp files)
-  if zstd -T0 -o "$ZST_PATH" -- "$SRC"; then
+  # run zstd quietly to avoid progress bars in logs
+  if zstd -q -T0 -o "$ZST_PATH" -- "$SRC"; then
   created_zst=1
   # write checksum file (newline-terminated) named after original WAL
   printf '%s\n' "$SRC_CHKSUM" > "$CHKSUM_PATH"
