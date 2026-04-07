@@ -22,13 +22,14 @@ Usage: $0 <instance> <filename> <target>
 
 Examples:
   $0 main 00000001000000000000000A /var/lib/postgresql/12/main/pg_wal/00000001000000000000000A
-  $0 main 20260407T173100Z.backup /tmp/20260407T173100Z.backup
+  $0 main 00000001.history /tmp/00000001.history
 
 Environment:
   BACKUP_BASE (optional) - default: /var/lib/postgresql/backup
 
-This script strictly supports the canonical formats produced by the archiver
-and will not attempt heuristics or alternate suffixes.
+This script strictly supports the canonical compressed WAL and timeline
+history formats produced by the archive tooling and will not attempt
+heuristics or alternate suffixes.
 EOF
   exit 2
 }
@@ -61,75 +62,52 @@ trap 'rc=$?; echo "Error restoring $FILENAME to $TARGET (exit $rc)" >&2; cleanup
 
 mkdir -p "$(dirname -- "$TARGET")"
 
-case "$FILENAME" in
-  *.backup)
-    SRC="$INFO_DIR/$FILENAME"
-    CHKSUM_FILE="$SRC.sha256"
-    if [ ! -f "$SRC" ]; then
-      echo "Backup metadata not found: $SRC" >&2
-      exit 2
-    fi
-    if [ ! -f "$CHKSUM_FILE" ]; then
-      echo "Checksum file missing for backup metadata: $CHKSUM_FILE" >&2
-      exit 2
-    fi
-    # compute checksum of the stored file and compare to recorded checksum
-    RECORDED=$(tr -d ' \r\n' < "$CHKSUM_FILE" || true)
-    ACTUAL=$(sha256sum "$SRC" | awk '{print $1}')
-    if [ "$RECORDED" != "$ACTUAL" ]; then
-      echo "Checksum mismatch for $SRC: recorded=$RECORDED actual=$ACTUAL" >&2
-      exit 2
-    fi
-    # copy to target
-    if cp -- "$SRC" "$TARGET"; then
-      created_target=1
-      trap - ERR INT TERM
-      echo "Restored backup metadata $SRC -> $TARGET"
-      exit 0
-    else
-      echo "Failed to copy $SRC to $TARGET" >&2
-      exit 2
-    fi
-    ;;
-  *)
-    # canonical WAL segment: expect <filename>.zst and <filename>.sha256
-    # validate filename looks like a WAL segment (24 hex) to avoid accidental paths
-    F_UPPER=$(echo "$FILENAME" | tr '[:lower:]' '[:upper:]')
-    if ! [[ "$F_UPPER" =~ ^[0-9A-F]{24}$ ]]; then
-      echo "WAL filename does not look like a 24-hex segment name: $FILENAME" >&2
-      exit 2
-    fi
-    ZST_PATH="$WAL_DIR/$FILENAME.zst"
-    CHKSUM_PATH="$WAL_DIR/$FILENAME.sha256"
-    if [ ! -f "$ZST_PATH" ]; then
-      echo "Compressed WAL not found: $ZST_PATH" >&2
-      exit 2
-    fi
-    if [ ! -f "$CHKSUM_PATH" ]; then
-      echo "Checksum file missing for WAL: $CHKSUM_PATH" >&2
-      exit 2
-    fi
-    if ! command -v zstd >/dev/null 2>&1; then
-      echo "zstd not found in PATH (required to decompress WAL)" >&2
-      exit 2
-    fi
+# Accept either a WAL segment name (24 hex) or a timeline history basename
+# like <8hex>.history. Both are stored compressed with a .zst suffix and the
+# checksum file is the basename + .sha256 (checksum of the original uncompressed
+# content).
 
-    # Decompress directly to the requested target
-    if zstd -d -q -o "$TARGET" -- "$ZST_PATH"; then
-      created_target=1
-      # verify checksum of decompressed file matches recorded checksum (which is checksum of original content)
-      RECORDED=$(tr -d ' \r\n' < "$CHKSUM_PATH" || true)
-      ACTUAL=$(sha256sum "$TARGET" | awk '{print $1}')
-      if [ "$RECORDED" != "$ACTUAL" ]; then
-        echo "Checksum mismatch after decompression: recorded=$RECORDED actual=$ACTUAL" >&2
-        exit 2
-      fi
-      trap - ERR INT TERM
-      echo "Restored WAL $ZST_PATH -> $TARGET"
-      exit 0
-    else
-      echo "Decompression failed for $ZST_PATH" >&2
+# Determine type: WAL (24-hex) or history (8hex.history)
+if [[ "$FILENAME" =~ ^[0-9A-Fa-f]{24}$ ]]; then
+  # WAL segment
+  BASE="$FILENAME"
+  ZST_PATH="$WAL_DIR/${BASE}.zst"
+  CHKSUM_PATH="$WAL_DIR/${BASE}.sha256"
+elif [[ "$FILENAME" =~ ^([0-9A-Fa-f]{8})\.history$ ]]; then
+  BASE="$FILENAME"
+  ZST_PATH="$WAL_DIR/${BASE}.zst"
+  CHKSUM_PATH="$WAL_DIR/${BASE}.sha256"
+else
+  echo "Filename must be either a 24-hex WAL segment or an 8-hex timeline history (e.g. 00000001.history): $FILENAME" >&2
+  exit 2
+fi
+
+if [ ! -f "$ZST_PATH" ]; then
+  echo "Compressed source not found: $ZST_PATH" >&2
+  exit 2
+fi
+if ! command -v zstd >/dev/null 2>&1; then
+  echo "zstd not found in PATH (required to decompress)" >&2
+  exit 2
+fi
+
+# Decompress to target and verify checksum
+if zstd -d -q -o "$TARGET" -- "$ZST_PATH"; then
+  created_target=1
+  # Only verify checksum if it exists; do not require it.
+  if [ -f "$CHKSUM_PATH" ]; then
+    RECORDED=$(tr -d ' \r\n' < "$CHKSUM_PATH" || true)
+    ACTUAL=$(sha256sum "$TARGET" | awk '{print $1}')
+    if [ "$RECORDED" != "$ACTUAL" ]; then
+      echo "Checksum mismatch after decompression: recorded=$RECORDED actual=$ACTUAL" >&2
       exit 2
     fi
-    ;;
-esac
+  fi
+  trap - ERR INT TERM
+  echo "Restored $ZST_PATH -> $TARGET"
+  exit 0
+else
+  echo "Decompression failed for $ZST_PATH" >&2
+  exit 2
+fi
+
