@@ -71,8 +71,26 @@ IFS=$'\n' sorted=($(printf "%s\n" "${candidates[@]}" | sort))
 newest_index=$((${#sorted[@]} - 1))
 newest_name="${sorted[$newest_index]}"
 
-now=$(date -u +%s)
 to_delete=()
+
+# Compute a cutoff timestamp string in the same sortable format as our
+# backup folders (YYYYMMDDTHHMMSSZ). Any folder lexicographically less than
+# this cutoff is older than MAX_AGE_DAYS. To avoid relying on date's
+# heuristic text parsing we compute the cutoff epoch explicitly and then
+# format it with an explicit '@epoch' style conversion.
+NOW_EPOCH=$(date -u +%s 2>/dev/null || true)
+if [ -z "$NOW_EPOCH" ]; then
+  echo "Could not get current epoch time from 'date'; aborting to avoid accidental deletes" >&2
+  exit 2
+fi
+CUT_EPOCH=$(( NOW_EPOCH - (MAX_AGE_DAYS * 86400) ))
+CUT_OFF_STR=""
+if CUT_OFF_STR=$(date -u -d "@${CUT_EPOCH}" +%Y%m%dT%H%M%SZ 2>/dev/null); then
+  :
+else
+  echo "Could not format cutoff epoch ${CUT_EPOCH}; aborting to avoid accidental deletes" >&2
+  exit 2
+fi
 
 for i in "${!sorted[@]}"; do
   name="${sorted[$i]}"
@@ -80,22 +98,8 @@ for i in "${!sorted[@]}"; do
   if [ "$i" -eq "$newest_index" ]; then
     continue
   fi
-  # parse timestamp (YYYYMMDDTHHMMSSZ) into epoch seconds
-  # GNU date accepted: date -u -d 'YYYYMMDDTHHMMSSZ' +%s
-  ts_epoch=0
-  if ts_epoch=$(date -u -d "$name" +%s 2>/dev/null || true); then
-    : # parsed successfully
-  else
-    # try with replacing 'T' and 'Z' for some implementations
-    if ts_epoch=$(date -u -d "${name/T/ }" +%s 2>/dev/null || true); then
-      :
-    else
-      echo "Skipping unparsable timestamp folder: $name" >&2
-      continue
-    fi
-  fi
-  age_days=$(( (now - ts_epoch) / 86400 ))
-  if [ "$age_days" -gt "$MAX_AGE_DAYS" ]; then
+  # Lexicographic compare: timestamps in format YYYYMMDDTHHMMSSZ sort correctly
+  if [[ "$name" < "$CUT_OFF_STR" ]]; then
     to_delete+=("$TARGET_DIR/$name")
   fi
 done
@@ -110,7 +114,8 @@ if [ -n "${DRY_RUN:-}" ]; then
   for d in "${to_delete[@]}"; do
     echo "  $d"
   done
-  exit 0
+  echo "DRY RUN: continuing to WAL and history pruning simulation (no destructive actions will be performed)."
+  # do not exit here; allow DRY_RUN to simulate WAL and history pruning as well
 fi
 
 echo "Pruning ${#to_delete[@]} backup(s) older than ${MAX_AGE_DAYS} day(s) under $TARGET_DIR (kept newest: $newest_name)"
@@ -149,46 +154,96 @@ if [ ! -f "$manifest_info" ]; then
   exit 0
 fi
 
-# Extract Start-LSN (from textual backup info) and compute WAL filename
-START_LSN=""
-START_LSN=$(grep -m1 -oP 'START WAL LOCATION:\s*\K[0-9A-Fa-f/]+' "$manifest_info" 2>/dev/null || true)
-if [ -z "$START_LSN" ]; then
-  echo "Start-LSN not found in $manifest_info; skipping WAL pruning" >&2
-  echo "Housekeeping complete."
-  exit 0
-fi
-
-if ! command -v psql >/dev/null 2>&1; then
-  echo "psql not available; skipping WAL pruning" >&2
-  echo "Housekeeping complete."
-  exit 0
-fi
-
-CUTOFF_WAL=$(psql -t -A -c "SELECT pg_walfile_name('$START_LSN'::pg_lsn);" 2>/dev/null || true)
+# The backup_info contains a line that already includes the WAL filename inside
+# a '(file ...)' token, for example:
+#   START WAL LOCATION: 0/20000028 (file 000000010000000000000020)
+# We will extract the 'file' token directly and use it as the cutoff WAL name.
+CUTOFF_WAL=""
+CUTOFF_WAL=$(grep -m1 -oP '\(file\s*\K[0-9A-Fa-f]+' "$manifest_info" 2>/dev/null || true)
 if [ -z "$CUTOFF_WAL" ]; then
-  echo "Could not compute cutoff WAL from Start-LSN '$START_LSN'; skipping WAL pruning" >&2
+  echo "WAL filename token '(file ...)' not found in $manifest_info; skipping WAL pruning" >&2
   echo "Housekeeping complete."
   exit 0
 fi
 
 echo "Pruning WAL archives older than $CUTOFF_WAL in $WAL_DIR (based on oldest remaining backup $oldest_remaining_name)"
 if [ -d "$WAL_DIR" ]; then
-  for wf in "$WAL_DIR"/*.zst; do
-    [ -e "$wf" ] || continue
-    wbase="${wf##*/}"
-    wbase="${wbase%.zst}"
-    if [[ "$wbase" < "$CUTOFF_WAL" ]]; then
-      if [ -n "${DRY_RUN:-}" ]; then
-        echo "DRY RUN: would delete WAL $wf and checksum $WAL_DIR/${wbase}.sha256"
-      else
-        echo "Deleting WAL $wf"
-        rm -f -- "$wf"
-        rm -f -- "$WAL_DIR/${wbase}.sha256" || true
-      fi
-    fi
-  done
+  # validate cutoff is a 24-hex WAL segment name
+  CUTOFF_WAL_UPPER=$(echo "$CUTOFF_WAL" | tr '[:lower:]' '[:upper:]')
+  if ! [[ "$CUTOFF_WAL_UPPER" =~ ^[0-9A-F]{24}$ ]]; then
+    echo "Computed cutoff WAL '$CUTOFF_WAL' does not look like a 24-hex WAL filename; skipping WAL pruning" >&2
+  else
+    # consider common compressed suffixes (.zst, .zstd). Use lexicographic compare
+    for ext in zst zstd; do
+      for wf in "$WAL_DIR"/*."$ext"; do
+        [ -e "$wf" ] || continue
+        wbase="${wf##*/}"
+        wbase="${wbase%.$ext}"
+        wbase_upper=$(echo "$wbase" | tr '[:lower:]' '[:upper:]')
+        if ! [[ "$wbase_upper" =~ ^[0-9A-F]{24}$ ]]; then
+          echo "Skipping non-conforming WAL file: $wf"
+          continue
+        fi
+        if [[ "$wbase_upper" < "$CUTOFF_WAL_UPPER" ]]; then
+          if [ -n "${DRY_RUN:-}" ]; then
+            echo "DRY RUN: would delete WAL $wf and checksum $WAL_DIR/${wbase}.sha256"
+          else
+            echo "Deleting WAL $wf"
+            rm -f -- "$wf"
+            rm -f -- "$WAL_DIR/${wbase}.sha256" || true
+          fi
+        fi
+      done
+    done
+  fi
 else
   echo "WAL directory $WAL_DIR does not exist; nothing to prune" >&2
+fi
+
+
+# Timeline history pruning: extract START TIMELINE from backup_info and remove
+# older timeline history files from the WAL dir. The backup_info contains a
+# line like: START TIMELINE: 2
+# We convert that to an 8-digit hex (e.g. 00000002) and delete any
+# '<8hex>.history*' where the hex numeric value is less than the cutoff.
+TIMELINE_NUM=""
+TIMELINE_NUM=$(grep -m1 -oP 'START TIMELINE:\s*\K[0-9]+' "$manifest_info" 2>/dev/null || true)
+if [ -n "$TIMELINE_NUM" ]; then
+  # Deterministic rule: START TIMELINE is always decimal.
+  TIMELINE_DEC=$TIMELINE_NUM
+  if [ -z "${TIMELINE_DEC:-}" ]; then
+    # nothing sensible to do
+    :
+  else
+    # Use arithmetic expansion to guarantee a numeric value is passed to printf
+    TIMELINE_HEX=$(printf "%08X" "$((TIMELINE_DEC))")
+    echo "Pruning timeline history files older than ${TIMELINE_HEX}.history in $WAL_DIR (based on START TIMELINE $TIMELINE_NUM)"
+  fi
+  if [ -d "$WAL_DIR" ]; then
+    for hf in "$WAL_DIR"/*.history*; do
+      [ -e "$hf" ] || continue
+      hbase="${hf##*/}"
+      # extract leading 8-hex chars
+      hist_hex=$(echo "$hbase" | sed -E 's/^([0-9A-Fa-f]{8}).*/\1/')
+      if ! [[ "$hist_hex" =~ ^[0-9A-Fa-f]{8}$ ]]; then
+        echo "Skipping non-conforming history file: $hf"
+        continue
+      fi
+      # use uppercase fixed-width hex string for lexicographic compare
+      hist_hex_up=$(echo "$hist_hex" | tr '[:lower:]' '[:upper:]')
+      TIMELINE_HEX_UP=$(echo "$TIMELINE_HEX" | tr '[:lower:]' '[:upper:]')
+      if [[ "$hist_hex_up" < "$TIMELINE_HEX_UP" ]]; then
+        if [ -n "${DRY_RUN:-}" ]; then
+          echo "DRY RUN: would delete history $hf"
+        else
+          echo "Deleting history $hf"
+          rm -f -- "$hf"
+        fi
+      fi
+    done
+  else
+    echo "WAL directory $WAL_DIR does not exist; skipping history pruning" >&2
+  fi
 fi
 
 echo "Housekeeping complete."
