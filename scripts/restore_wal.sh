@@ -67,20 +67,10 @@ mkdir -p "$(dirname -- "$TARGET")"
 # checksum file is the basename + .sha256 (checksum of the original uncompressed
 # content).
 
-# Determine type: WAL (24-hex) or history (8hex.history)
-if [[ "$FILENAME" =~ ^[0-9A-Fa-f]{24}$ ]]; then
-  # WAL segment
-  BASE="$FILENAME"
-  ZST_PATH="$WAL_DIR/${BASE}.zst"
-  CHKSUM_PATH="$WAL_DIR/${BASE}.sha256"
-elif [[ "$FILENAME" =~ ^([0-9A-Fa-f]{8})\.history$ ]]; then
-  BASE="$FILENAME"
-  ZST_PATH="$WAL_DIR/${BASE}.zst"
-  CHKSUM_PATH="$WAL_DIR/${BASE}.sha256"
-else
-  echo "Filename must be either a 24-hex WAL segment or an 8-hex timeline history (e.g. 00000001.history): $FILENAME" >&2
-  exit 2
-fi
+# Simpler behavior per user request: do not inspect the filename format.
+# If a compressed file named <filename>.zst exists in the WAL dir, restore it.
+ZST_PATH="$WAL_DIR/${FILENAME}.zst"
+CHKSUM_PATH="$WAL_DIR/${FILENAME}.sha256"
 
 if [ ! -f "$ZST_PATH" ]; then
   echo "Compressed source not found: $ZST_PATH" >&2
