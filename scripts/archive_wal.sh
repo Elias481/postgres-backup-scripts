@@ -12,13 +12,13 @@ usage() {
   cat <<EOF
 Usage: $0 <backup-base> <instance> <source-file>
 
-Examples:
+  Examples:
   $0 /var/lib/postgresql/backup main /var/lib/postgresql/wal/00000001000000000000000A
-  $0 /var/lib/postgresql/backup main /var/lib/postgresql/backup/main/20260407T173100Z.backup
+  $0 /var/lib/postgresql/backup main /path/to/20260407T173100Z.backup
 
 Notes:
 - WAL archives go to <backup-base>/<instance>/wal as <basename>.zst
-- Files ending with .backup are copied (not compressed) to <backup-base>/<instance>/backup/info
+- Files ending with .backup are copied (not compressed) to <backup-base>/<instance>/info
 - A checksum file <basename>.sha256 (SHA256 of original content) is created next to the stored file
 EOF
   exit 2
@@ -38,7 +38,7 @@ if [ ! -f "$SRC" ]; then
 fi
 
 WAL_DIR="$BACKUP_BASE/$INSTANCE/wal"
-BACKUP_INFO_DIR="$BACKUP_BASE/$INSTANCE/backup/info"
+BACKUP_INFO_DIR="$BACKUP_BASE/$INSTANCE/info"
 
 mkdir -p "$WAL_DIR" "$BACKUP_INFO_DIR"
 
