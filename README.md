@@ -11,28 +11,36 @@ Files of interest
 Integration examples
 Below are concrete examples showing how to hook the scripts into PostgreSQL and how to schedule backups and housekeeping. Adjust paths, users and permissions to match your environment.
 
-PostgreSQL configuration (archive + recovery)
+PostgreSQL configuration (archive + restore)
 
-Put both entries in your `postgresql.conf` so PostgreSQL can archive WAL segments during normal operation and recover them during standby/recovery.
+Configure both entries in `postgresql.conf` so PostgreSQL can archive WAL segments during normal operation and recover them during standby/recovery. Below each entry is presented with the same structure: purpose, example, and short notes.
 
-Archive command (in `postgresql.conf`):
+Archive command
+
+Purpose
+  - Make PostgreSQL hand off completed WAL segments to the archive/collector.
+
+Example (in `postgresql.conf`)
 
   archive_mode = on
   archive_command = '/usr/local/bin/archive_wal.sh /var/lib/postgresql/backup main %p'
 
-Notes:
-- `%p` expands to the absolute path of the WAL file; the archiver script expects a source path.
-- For logging, wrap in a shell:
+Notes
+  - `%p` expands to the absolute path of the WAL file; the archiver script expects a source path.
+  - For logging, wrap in a shell: `archive_command = 'sh -c "/usr/local/bin/archive_wal.sh /var/lib/postgresql/backup main %p >> /var/log/postgres/archive_wal.log 2>&1"'`
 
-  archive_command = 'sh -c "/usr/local/bin/archive_wal.sh /var/lib/postgresql/backup main %p >> /var/log/postgres/archive_wal.log 2>&1"'
+Restore command (used during recovery)
 
-Restore command for recovery (in `postgresql.conf` or `recovery.conf`):
+Purpose
+  - Instruct PostgreSQL how to obtain and place WAL segments during recovery from the archive.
+
+Example (in `postgresql.conf` or `recovery.conf`)
 
   restore_command = '/usr/local/bin/restore_wal.sh /var/lib/postgresql/backup main %f "%p"'
 
-Notes:
-- `%f` expands to the requested WAL filename; PostgreSQL will call the restore script during recovery to fetch and decompress archives into place.
-- The restore script leaves the `.zst` archive in place and will validate checksum if a `.sha256` file exists.
+Notes
+  - `%f` expands to the requested WAL filename; PostgreSQL will call the restore script during recovery to fetch and decompress archives into place.
+  - The restore script writes the decompressed WAL into the requested path and will validate it against `<basename>.sha256` if present. The archive `.zst` file is left intact.
 
 Scheduling (cron and systemd examples)
 Below are example cron entries and systemd service+timer units for the two scheduled tasks: `pgbase_backup.sh` and `backup_housekeeping.sh`.
