@@ -11,20 +11,89 @@ Files of interest
 Integration examples
 Below are concrete examples showing how to hook the scripts into PostgreSQL and how to schedule backups and housekeeping. Adjust paths, users and permissions to match your environment.
 
-1) PostgreSQL `postgresql.conf` (archive command)
+PostgreSQL configuration (archive + recovery)
 
-Enable archiving and call the archiver script. Use the full path and run as the Postgres user.
+Put both entries in your `postgresql.conf` so PostgreSQL can archive WAL segments during normal operation and recover them during standby/recovery.
 
-Example (in `postgresql.conf`):
+Archive command (in `postgresql.conf`):
 
   archive_mode = on
   archive_command = '/usr/local/bin/archive_wal.sh /var/lib/postgresql/backup main %p'
 
 Notes:
 - `%p` expands to the absolute path of the WAL file; the archiver script expects a source path.
-- If you prefer logging, wrap in a shell: `archive_command = 'sh -c "/usr/local/bin/archive_wal.sh /var/lib/postgresql/backup main %p >> /var/log/postgres/archive_wal.log 2>&1"'`
+- For logging, wrap in a shell:
 
-2) Scheduling `pgbase_backup.sh`
+  archive_command = 'sh -c "/usr/local/bin/archive_wal.sh /var/lib/postgresql/backup main %p >> /var/log/postgres/archive_wal.log 2>&1"'
+
+Restore command for recovery (in `postgresql.conf` or `recovery.conf`):
+
+  restore_command = '/usr/local/bin/restore_wal.sh /var/lib/postgresql/backup main %f "%p"'
+
+Notes:
+- `%f` expands to the requested WAL filename; PostgreSQL will call the restore script during recovery to fetch and decompress archives into place.
+- The restore script leaves the `.zst` archive in place and will validate checksum if a `.sha256` file exists.
+
+Scheduling (cron and systemd examples)
+Below are example cron entries and systemd service+timer units for the two scheduled tasks: `pgbase_backup.sh` and `backup_housekeeping.sh`.
+
+Cron examples
+
+# crontab -u postgres -e
+# daily base backup at 02:00
+0 2 * * * /usr/local/bin/pgbase_backup.sh /var/lib/postgresql/backup main >> /var/log/pgbase_backup.log 2>&1
+
+# weekly housekeeping on Sunday at 03:00 (keeps 30 days by default)
+0 3 * * 0 /usr/local/bin/backup_housekeeping.sh /var/lib/postgresql/backup main 30 >> /var/log/backup_housekeeping.log 2>&1
+
+Systemd unit + timer examples (recommended on systemd systems)
+
+# /etc/systemd/system/pgbase-backup.service
+[Unit]
+Description=Run pg_basebackup wrapper for main
+After=network.target
+
+[Service]
+Type=oneshot
+User=postgres
+ExecStart=/usr/local/bin/pgbase_backup.sh /var/lib/postgresql/backup main
+
+# /etc/systemd/system/pgbase-backup.timer
+[Unit]
+Description=Daily timer for pgbase-backup
+
+[Timer]
+OnCalendar=*-*-* 02:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+
+# /etc/systemd/system/backup-housekeeping.service
+[Unit]
+Description=Run backup housekeeping for postgres backups
+After=network.target
+
+[Service]
+Type=oneshot
+User=postgres
+ExecStart=/usr/local/bin/backup_housekeeping.sh /var/lib/postgresql/backup main 30
+
+# /etc/systemd/system/backup-housekeeping.timer
+[Unit]
+Description=Weekly timer for backup-housekeeping
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+
+Enable and start the timers:
+
+  systemctl daemon-reload
+  systemctl enable --now pgbase-backup.timer backup-housekeeping.timer
 
 Cron example: full base backup every day at 02:00 as the `postgres` user
 
@@ -96,7 +165,7 @@ Enable and start the timer:
 
 4) Restoring WAL / timeline history (used as PostgreSQL restore_command)
 
-`restore_wal.sh` is written to be used automatically by PostgreSQL during recovery via the `restore_command` (or `recovery.conf`) as well as for manual, on-demand restores. Example `postgresql.conf` setting for recovery:
+`restore_wal.sh` is written to be used automatically by PostgreSQL during recovery via the `restore_command` (or `recovery.conf`). Example `postgresql.conf` setting for recovery:
 
   restore_command = '/usr/local/bin/restore_wal.sh /var/lib/postgresql/backup main %f "%p"'
 
@@ -114,6 +183,7 @@ Prerequisites
   - `zstd` (required for compression/decompression of WAL/history)
   - `pg_basebackup` and `psql` when using the `pgbase_backup.sh` wrapper
   - `date`, `find`, `grep`, `awk`, `sed`, `tr`, `cp`, `rm`
+  - `jq` (optional) — useful for parsing JSON manifests if you extend the tooling; not required by the provided scripts.
 
 Layout expectations
 - A backup base directory such as `/var/lib/postgresql/backup` with per-instance subdirectories:
