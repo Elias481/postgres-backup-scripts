@@ -8,10 +8,104 @@ Files of interest
 - `scripts/backup_housekeeping.sh` — deterministic, lexicographic, time-based pruning of old backups, plus WAL and timeline history pruning; supports `DRY_RUN=1` for simulation.
 - `scripts/restore_wal.sh` — restore a compressed WAL or timeline history file from the archive to a requested target and optionally verify checksum if present.
 
-Quick principles
-- Deterministic only: the scripts intentionally avoid heuristic filename guessing. They only accept canonical formats and canonical locations.
-- Single canonical checksum format: checksum files are named `<basename>.sha256` and contain the SHA256 of the original (uncompressed) content.
-- Non-destructive restores: `restore_wal.sh` reads and decompresses archives but does not delete source `.zst` files unless you explicitly change that behavior.
+Integration examples
+Below are concrete examples showing how to hook the scripts into PostgreSQL and how to schedule backups and housekeeping. Adjust paths, users and permissions to match your environment.
+
+1) PostgreSQL `postgresql.conf` (archive command)
+
+Enable archiving and call the archiver script. Use the full path and run as the Postgres user.
+
+Example (in `postgresql.conf`):
+
+  archive_mode = on
+  archive_command = '/usr/local/bin/archive_wal.sh /var/lib/postgresql/backup main %p'
+
+Notes:
+- `%p` expands to the absolute path of the WAL file; the archiver script expects a source path.
+- If you prefer logging, wrap in a shell: `archive_command = 'sh -c "/usr/local/bin/archive_wal.sh /var/lib/postgresql/backup main %p >> /var/log/postgres/archive_wal.log 2>&1"'`
+
+2) Scheduling `pgbase_backup.sh`
+
+Cron example: full base backup every day at 02:00 as the `postgres` user
+
+  # crontab -u postgres -e
+  0 2 * * * /usr/local/bin/pgbase_backup.sh /var/lib/postgresql/backup main >> /var/log/pgbase_backup.log 2>&1
+
+Systemd unit + timer example (recommended on systemd systems)
+
+  # /etc/systemd/system/pgbase-backup.service
+  [Unit]
+  Description=Run pg_basebackup wrapper for main
+  After=network.target
+
+  [Service]
+  Type=oneshot
+  User=postgres
+  ExecStart=/usr/local/bin/pgbase_backup.sh /var/lib/postgresql/backup main
+
+  # /etc/systemd/system/pgbase-backup.timer
+  [Unit]
+  Description=Daily timer for pgbase-backup
+
+  [Timer]
+  OnCalendar=*-*-* 02:00:00
+  Persistent=true
+
+  [Install]
+  WantedBy=timers.target
+
+Enable and start the timer:
+
+  systemctl daemon-reload
+  systemctl enable --now pgbase-backup.timer
+
+3) Scheduling `backup_housekeeping.sh`
+
+Cron example: weekly housekeeping on Sunday at 03:00 (keeps 30 days by default)
+
+  # crontab -u postgres -e
+  0 3 * * 0 /usr/local/bin/backup_housekeeping.sh /var/lib/postgresql/backup main 30 >> /var/log/backup_housekeeping.log 2>&1
+
+Systemd timer example (run weekly)
+
+  # /etc/systemd/system/backup-housekeeping.service
+  [Unit]
+  Description=Run backup housekeeping for postgres backups
+  After=network.target
+
+  [Service]
+  Type=oneshot
+  User=postgres
+  ExecStart=/usr/local/bin/backup_housekeeping.sh /var/lib/postgresql/backup main 30
+
+  # /etc/systemd/system/backup-housekeeping.timer
+  [Unit]
+  Description=Weekly timer for backup-housekeeping
+
+  [Timer]
+  OnCalendar=weekly
+  Persistent=true
+
+  [Install]
+  WantedBy=timers.target
+
+Enable and start the timer:
+
+  systemctl daemon-reload
+  systemctl enable --now backup-housekeeping.timer
+
+4) Restoring WAL / timeline history (used as PostgreSQL restore_command)
+
+`restore_wal.sh` is written to be used automatically by PostgreSQL during recovery via the `restore_command` (or `recovery.conf`) as well as for manual, on-demand restores. Example `postgresql.conf` setting for recovery:
+
+  restore_command = '/usr/local/bin/restore_wal.sh /var/lib/postgresql/backup main %f "%p"'
+
+Notes:
+- PostgreSQL expands `%f` to the requested WAL filename; the script will look for `/var/lib/postgresql/backup/main/wal/<filename>.zst` and decompress it to the requested path.
+- If a checksum file exists (`<filename>.sha256`) the script will validate the decompressed file and fail on mismatch. If no checksum exists, a successful decompression is treated as success (exit 0).
+- The archive `.zst` is left untouched by the restore operation so repeated recovery attempts remain possible.
+
+Recommendation: install `jq` on systems that run `pg_basebackup` and housekeeping; some parts of the tooling and future helpers may use `jq` to parse JSON manifests and make deterministic decisions more robustly. It's small and widely available via package managers.
 
 Prerequisites
 - Bash (POSIX shell) environment for running scripts.
